@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AI 할 일 플래너</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="top">
+    <h1>AI 할 일 플래너</h1>
+    <button id="settingsBtn" class="ghost" aria-label="설정">⚙ 설정</button>
+  </header>
+
+  <main>
+    <!-- 1. 입력 -->
+    <section class="card">
+      <h2>할 일 적기</h2>
+      <textarea id="todoInput" rows="8"
+        placeholder="생각나는 대로 적으세요. 예)&#10;- 금요일까지 수학 수행평가 보고서&#10;- 유니티 점프 버그 고치기 (급함)&#10;- 토요일 오후 3시 치과&#10;- 매일 30분 영단어"></textarea>
+
+      <div class="row">
+        <label>시작 날짜 <input type="date" id="startDate"></label>
+        <label>며칠치 <input type="number" id="days" min="1" max="14" value="3"></label>
+      </div>
+      <div class="row">
+        <label>하루 시작 <input type="time" id="dayStart" value="09:00"></label>
+        <label>하루 끝 <input type="time" id="dayEnd" value="22:00"></label>
+      </div>
+
+      <button id="planBtn" class="primary">AI로 일정 만들기</button>
+      <p id="status" class="status"></p>
+    </section>
+
+    <!-- 2. 결과 -->
+    <section id="result" class="hidden">
+      <div class="card">
+        <h2>요약</h2>
+        <p id="summary"></p>
+        <ul id="priorityList" class="priority"></ul>
+      </div>
+
+      <div class="card">
+        <h2>일정표</h2>
+        <div id="dayTabs" class="tabs"></div>
+        <ol id="timeline" class="timeline"></ol>
+      </div>
+    </section>
+  </main>
+
+  <!-- 설정 창 -->
+  <dialog id="settings">
+    <form method="dialog" class="settings-form">
+      <h2>AI 설정</h2>
+      <label>AI 회사
+        <select id="provider">
+          <option value="gemini">Google Gemini</option>
+          <option value="openai">OpenAI (GPT)</option>
+          <option value="claude">Anthropic (Claude)</option>
+        </select>
+      </label>
+      <label>모델 이름 <input id="model" type="text"></label>
+      <label>API 키 <input id="apiKey" type="password" autocomplete="off"></label>
+      <p class="hint">키는 이 브라우저에만 저장되고, 선택한 AI 회사 서버로만 전송됩니다.</p>
+      <div class="row">
+        <button value="cancel" class="ghost">닫기</button>
+        <button id="saveSettings" value="save" class="primary">저장</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="app.js"></script>
+</body>
+</html>
