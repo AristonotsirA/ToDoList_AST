@@ -1,11 +1,4 @@
-// ===== 1. 설정값 =====
-// 회사별 기본 모델. 모델이 바뀌면 설정 창에서 이름만 고치면 됩니다.
-const DEFAULT_MODELS = {
-  gemini: "gemini-flash-latest",
-  openai: "gpt-5.4-mini",
-  claude: "claude-haiku-5-5",
-};
-
+// ===== 1. 저장소 & 상태 =====
 // localStorage는 막혀 있는 환경도 있어서 try/catch로 감쌉니다.
 const store = {
   get(key, fallback) {
@@ -21,10 +14,16 @@ const store = {
 
 const $ = (id) => document.getElementById(id);
 
-let settings = store.get("settings", { provider: "gemini", model: DEFAULT_MODELS.gemini, apiKey: "" });
-let plan = store.get("plan", null);   // AI가 만든 결과
-let done = store.get("done", {});     // 체크한 일정 { "날짜|시간|제목": true }
+// models: 찾은 모델 목록(추천 순서), model: 우선 사용할 모델
+let settings = store.get("settings", { provider: "gemini", apiKey: "", models: [], model: "" });
+if (!Array.isArray(settings.models)) settings.models = [];   // 예전 버전 설정 호환
+
+let cooldown = store.get("cooldown", {}); // { "회사:모델": 다시 써도 되는 시각(ms) }
+let plan = store.get("plan", null);       // AI가 만든 결과
+let done = store.get("done", {});         // 체크한 일정 { "날짜|시간|제목": true }
 let activeDay = 0;
+
+const COOLDOWN_MS = 60 * 60 * 1000;       // 한도 초과 모델은 1시간 동안 건너뜀
 
 // ===== 2. AI에게 보낼 지시문 =====
 function buildPrompt(todoText, opt) {
@@ -59,63 +58,158 @@ function buildPrompt(todoText, opt) {
 ${todoText}`;
 }
 
-// ===== 3. 회사별 API 호출 =====
-// 세 회사 모두 "글을 보내고 글을 받는다"는 건 같고, 주소·헤더·응답 모양만 다릅니다.
-async function callAI(prompt) {
-  const { provider, model, apiKey } = settings;
-  let res, data;
+// ===== 3. 회사별 요청 정보 =====
+// 🆕 객체 안에 함수를 넣어 "회사 이름 → 그 회사 방식"을 표처럼 정리했습니다.
+//    if문을 여러 번 쓰는 대신 PROVIDERS[provider].chat(...) 한 줄로 부를 수 있어요.
+const PROVIDERS = {
+  gemini: {
+    headers: (key) => ({ "Content-Type": "application/json", "x-goog-api-key": key }),
+    listUrl: "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000",
+    // 응답에서 "글 생성이 되는 gemini 모델" 이름만 뽑습니다.
+    pickModels: (data) => (data.models || [])
+      .filter((m) => m.supportedGenerationMethods?.includes("generateContent"))
+      .map((m) => m.name.replace("models/", "")),
+    chatUrl: (model) => `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+    chatBody: (model, prompt) => ({
+      contents: [{ role: "user", parts: [{ text: prompt }] }],
+      generationConfig: { responseMimeType: "application/json" },
+    }),
+    readText: (data) => data.candidates?.[0]?.content?.parts?.map((p) => p.text).join("") ?? "",
+  },
+  openai: {
+    headers: (key) => ({ "Content-Type": "application/json", Authorization: `Bearer ${key}` }),
+    listUrl: "https://api.openai.com/v1/models",
+    pickModels: (data) => (data.data || []).map((m) => m.id),
+    chatUrl: () => "https://api.openai.com/v1/chat/completions",
+    chatBody: (model, prompt) => ({
+      model,
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+    }),
+    readText: (data) => data.choices?.[0]?.message?.content ?? "",
+  },
+  claude: {
+    headers: (key) => ({
+      "Content-Type": "application/json",
+      "x-api-key": key,
+      "anthropic-version": "2023-06-01",
+      // 브라우저에서 직접 부를 때 Anthropic이 요구하는 헤더
+      "anthropic-dangerous-direct-browser-access": "true",
+    }),
+    listUrl: "https://api.anthropic.com/v1/models?limit=1000",
+    pickModels: (data) => (data.data || []).map((m) => m.id),
+    chatUrl: () => "https://api.anthropic.com/v1/messages",
+    chatBody: (model, prompt) => ({
+      model,
+      max_tokens: 4096,
+      messages: [{ role: "user", content: prompt }],
+    }),
+    readText: (data) => data.content?.map((c) => c.text || "").join("") ?? "",
+  },
+};
 
-  if (provider === "gemini") {
-    res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
-      body: JSON.stringify({
-        contents: [{ role: "user", parts: [{ text: prompt }] }],
-        generationConfig: { responseMimeType: "application/json" },
-      }),
-    });
-    data = await res.json();
-    if (!res.ok) throw new Error(data.error?.message || res.status);
-    return data.candidates?.[0]?.content?.parts?.map((p) => p.text).join("") ?? "";
+// 🆕 Error에 HTTP 상태 코드를 붙여서 던집니다. 받는 쪽에서 "왜 실패했는지"로 다음 행동을 고를 수 있어요.
+class ApiError extends Error {
+  constructor(status, message) {
+    super(message);
+    this.status = status;
   }
+}
 
-  if (provider === "openai") {
-    res = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-      body: JSON.stringify({
-        model,
-        messages: [{ role: "user", content: prompt }],
-        response_format: { type: "json_object" },
-      }),
-    });
-    data = await res.json();
-    if (!res.ok) throw new Error(data.error?.message || res.status);
-    return data.choices?.[0]?.message?.content ?? "";
+async function request(url, options) {
+  const res = await fetch(url, options);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new ApiError(res.status, data.error?.message || `HTTP ${res.status}`);
+  return data;
+}
+
+// ===== 4. 모델 자동으로 찾기 =====
+// 일정표 만들기에 맞지 않는 모델(이미지, 음성, 임베딩 등)을 이름으로 걸러냅니다.
+const EXCLUDE = /image|tts|audio|realtime|transcribe|embed|live|search|moderation|instruct|codex|computer|robotics|research|banana|lyria|veo|imagen|dall-e|whisper|babbage|davinci/i;
+
+function isChatModel(provider, id) {
+  const prefix = { gemini: /^gemini/, openai: /^(gpt-|o\d|chatgpt)/, claude: /^claude/ }[provider];
+  // OpenAI는 같은 모델의 날짜 붙은 버전(gpt-x-2025-01-01)이 잔뜩 있어서 빼줍니다.
+  // Claude는 목록이 날짜 붙은 이름으로만 오는 경우가 있어서 빼면 안 됩니다.
+  const dated = provider === "openai" && /-\d{4}-\d{2}-\d{2}$/.test(id);
+  return prefix.test(id) && !EXCLUDE.test(id) && !dated;
+}
+
+// 추천 순서: 빠르고 저렴한 모델 → 더 가벼운 모델 → 큰 모델 / 같은 등급이면 최신 버전 먼저, 정식이 프리뷰보다 먼저
+function rankModel(id) {
+  let tier = 2;                                         // pro, sonnet, opus, 일반 gpt 등
+  if (/lite|nano/.test(id)) tier = 1;
+  else if (/flash|haiku|-mini/.test(id)) tier = 0;     // "gemini" 안에도 mini가 있어서 -mini로 구분
+  if (/preview|exp/.test(id)) tier += 0.5;
+  const num = id.match(/(\d+)(?:[.-](\d))?/);           // gemini-3.8 / gpt-5.4 / claude-haiku-5-5
+  const version = /latest/.test(id) ? 999 : num ? Number(`${num[1]}.${num[2] || 0}`) : 0;
+  return { tier, version };
+}
+
+function sortModels(ids) {
+  return [...new Set(ids)].sort((a, b) => {
+    const ra = rankModel(a), rb = rankModel(b);
+    return ra.tier - rb.tier || rb.version - ra.version || a.localeCompare(b);
+  });
+}
+
+async function findModels(provider, apiKey) {
+  const p = PROVIDERS[provider];
+  const data = await request(p.listUrl, { headers: p.headers(apiKey) });
+  const models = sortModels(p.pickModels(data).filter((id) => isChatModel(provider, id)));
+  if (!models.length) throw new Error("사용할 수 있는 모델을 찾지 못했습니다.");
+  return models;
+}
+
+// ===== 5. 자동 전환하며 AI 호출 =====
+// 실패 이유에 따라 다르게 행동합니다.
+//  - 한도 초과(429): 그 모델을 1시간 쉬게 하고 다음 모델로
+//  - 모델 없음(404): 목록에서 빼고 다음 모델로
+//  - 서버 과부하(5xx): 다음 모델로
+//  - 키 오류(401/403), 결제·크레딧 부족: 계정 문제라 모델을 바꿔도 소용없으니 즉시 멈춤
+function isAccountProblem(err) {
+  return err.status === 401 || err.status === 403 ||
+    /insufficient_quota|credit balance|billing|API key not valid/i.test(err.message);
+}
+
+async function callWithFallback(prompt) {
+  const { provider, apiKey } = settings;
+  const p = PROVIDERS[provider];
+  const now = Date.now();
+
+  // 우선 모델을 맨 앞에 두고, 쉬는 중인 모델은 뒤로 미룹니다(다 쉬는 중이면 그래도 시도).
+  const order = [settings.model, ...settings.models.filter((m) => m !== settings.model)].filter(Boolean);
+  const ready = order.filter((m) => !(cooldown[`${provider}:${m}`] > now));
+  const resting = order.filter((m) => cooldown[`${provider}:${m}`] > now);
+  const queue = [...ready, ...resting];
+
+  const skipped = [];
+  for (const model of queue) {
+    setStatus(`AI가 일정을 짜는 중... (${model})`);
+    try {
+      const data = await request(p.chatUrl(model), {
+        method: "POST",
+        headers: p.headers(apiKey),
+        body: JSON.stringify(p.chatBody(model, prompt)),
+      });
+      return { text: p.readText(data), model, skipped };
+    } catch (err) {
+      if (!(err instanceof ApiError) || isAccountProblem(err)) throw err;
+
+      if (err.status === 429) {
+        cooldown[`${provider}:${model}`] = Date.now() + COOLDOWN_MS;
+        store.set("cooldown", cooldown);
+      } else if (err.status === 404) {
+        settings.models = settings.models.filter((m) => m !== model);
+        if (settings.model === model) settings.model = settings.models[0] || "";
+        store.set("settings", settings);
+      } else if (err.status < 500) {
+        throw err;   // 그 외 요청 오류는 모델 문제가 아니므로 멈춤
+      }
+      skipped.push(model);
+    }
   }
-
-  if (provider === "claude") {
-    res = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": apiKey,
-        "anthropic-version": "2023-06-01",
-        // 브라우저에서 직접 부를 때 Anthropic이 요구하는 헤더
-        "anthropic-dangerous-direct-browser-access": "true",
-      },
-      body: JSON.stringify({
-        model,
-        max_tokens: 4096,
-        messages: [{ role: "user", content: prompt }],
-      }),
-    });
-    data = await res.json();
-    if (!res.ok) throw new Error(data.error?.message || res.status);
-    return data.content?.map((c) => c.text || "").join("") ?? "";
-  }
-
-  throw new Error("알 수 없는 AI 회사입니다.");
+  throw new Error("모든 모델이 한도 초과이거나 사용할 수 없습니다. 잠시 후 다시 시도해주세요.");
 }
 
 // AI가 JSON 앞뒤에 ```json 같은 글을 붙여도 { ... } 부분만 꺼냅니다.
@@ -126,11 +220,14 @@ function parseJSON(text) {
   return JSON.parse(text.slice(start, end + 1));
 }
 
-// ===== 4. 버튼 동작 =====
+// ===== 6. 일정 만들기 버튼 =====
 async function makePlan() {
   const todoText = $("todoInput").value.trim();
   if (!todoText) return setStatus("할 일을 먼저 적어주세요.", true);
-  if (!settings.apiKey) { $("settings").showModal(); return setStatus("API 키를 먼저 설정해주세요.", true); }
+  if (!settings.apiKey || !settings.models.length) {
+    openSettings();
+    return setStatus("API 키를 넣고 모델을 찾아주세요.", true);
+  }
 
   const opt = {
     startDate: $("startDate").value,
@@ -140,9 +237,8 @@ async function makePlan() {
   };
 
   $("planBtn").disabled = true;
-  setStatus("AI가 일정을 짜는 중...");
   try {
-    const text = await callAI(buildPrompt(todoText, opt));
+    const { text, model, skipped } = await callWithFallback(buildPrompt(todoText, opt));
     plan = parseJSON(text);
     done = {};
     activeDay = 0;
@@ -150,7 +246,9 @@ async function makePlan() {
     store.set("done", done);
     store.set("todoText", todoText);
     render();
-    setStatus("완료!");
+    setStatus(skipped.length
+      ? `완료! (${skipped.join(", ")} 사용 불가 → ${model}로 자동 전환)`
+      : `완료! (${model})`);
   } catch (err) {
     setStatus("오류: " + err.message, true);
   } finally {
@@ -158,7 +256,7 @@ async function makePlan() {
   }
 }
 
-// ===== 5. 화면 그리기 =====
+// ===== 7. 화면 그리기 =====
 function render() {
   if (!plan) return;
   $("result").classList.remove("hidden");
@@ -192,7 +290,64 @@ function render() {
   }).join("") : `<li>이 날은 일정이 없어요.</li>`;
 }
 
-// ===== 6. 작은 도우미 함수들 =====
+// ===== 8. 설정 창 =====
+let foundModels = [];   // 설정 창에서 방금 찾은 목록(저장 전)
+
+function fillModelSelect(models, selected) {
+  $("model").innerHTML = models.length
+    ? models.map((m) => `<option value="${esc(m)}">${esc(m)}</option>`).join("")
+    : `<option value="">먼저 모델을 찾아주세요</option>`;
+  if (selected && models.includes(selected)) $("model").value = selected;
+  $("modelInfo").textContent = models.length
+    ? `${models.length}개 찾음 · 한도 초과 시 목록 순서대로 자동 전환`
+    : "";
+}
+
+function openSettings() {
+  $("provider").value = settings.provider;
+  $("apiKey").value = settings.apiKey;
+  foundModels = settings.models;
+  fillModelSelect(foundModels, settings.model);
+  $("settings").showModal();
+}
+
+async function onFindModels() {
+  const provider = $("provider").value;
+  const apiKey = $("apiKey").value.trim();
+  if (!apiKey) { $("modelInfo").textContent = "API 키를 먼저 넣어주세요."; return false; }
+
+  $("findModels").disabled = true;
+  $("modelInfo").textContent = "모델을 찾는 중...";
+  try {
+    foundModels = await findModels(provider, apiKey);
+    fillModelSelect(foundModels, foundModels[0]);
+    return true;
+  } catch (err) {
+    $("modelInfo").textContent = "모델 찾기 실패: " + err.message;
+    return false;
+  } finally {
+    $("findModels").disabled = false;
+  }
+}
+
+async function onSaveSettings() {
+  // 키나 회사가 바뀌었는데 모델을 아직 안 찾았다면 저장할 때 자동으로 찾습니다.
+  const changed = $("provider").value !== settings.provider || $("apiKey").value.trim() !== settings.apiKey;
+  if ((changed && foundModels === settings.models) || !foundModels.length) {
+    if (!(await onFindModels())) return;   // 실패하면 창을 닫지 않음
+  }
+  settings = {
+    provider: $("provider").value,
+    apiKey: $("apiKey").value.trim(),
+    models: foundModels,
+    model: $("model").value || foundModels[0],
+  };
+  store.set("settings", settings);
+  $("settings").close();
+  setStatus("설정을 저장했어요.");
+}
+
+// ===== 9. 작은 도우미 함수들 =====
 function setStatus(msg, isError = false) {
   $("status").textContent = msg;
   $("status").classList.toggle("error", isError);
@@ -212,8 +367,17 @@ function todayStr() {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 }
 
-// ===== 7. 이벤트 연결 =====
+// ===== 10. 이벤트 연결 =====
 $("planBtn").addEventListener("click", makePlan);
+$("settingsBtn").addEventListener("click", openSettings);
+$("findModels").addEventListener("click", onFindModels);
+$("saveSettings").addEventListener("click", onSaveSettings);
+
+// 회사를 바꾸면 이전 회사의 모델 목록은 쓸 수 없으니 비웁니다.
+$("provider").addEventListener("change", () => {
+  foundModels = [];
+  fillModelSelect([], "");
+});
 
 $("dayTabs").addEventListener("click", (e) => {
   const btn = e.target.closest("button");
@@ -229,29 +393,7 @@ $("timeline").addEventListener("change", (e) => {
   render();
 });
 
-$("settingsBtn").addEventListener("click", () => {
-  $("provider").value = settings.provider;
-  $("model").value = settings.model;
-  $("apiKey").value = settings.apiKey;
-  $("settings").showModal();
-});
-
-// 회사를 바꾸면 모델 이름을 그 회사 기본값으로 바꿔줍니다.
-$("provider").addEventListener("change", () => {
-  $("model").value = DEFAULT_MODELS[$("provider").value];
-});
-
-$("saveSettings").addEventListener("click", () => {
-  settings = {
-    provider: $("provider").value,
-    model: $("model").value.trim() || DEFAULT_MODELS[$("provider").value],
-    apiKey: $("apiKey").value.trim(),
-  };
-  store.set("settings", settings);
-  setStatus("설정을 저장했어요.");
-});
-
-// ===== 8. 시작 =====
+// ===== 11. 시작 =====
 $("startDate").value = todayStr();
 $("todoInput").value = store.get("todoText", "");
 render();

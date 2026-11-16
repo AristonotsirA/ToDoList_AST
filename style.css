@@ -76,6 +76,8 @@ button {
 .primary { background: var(--accent); color: #fff; border: none; width: 100%; margin-top: 12px; }
 .primary:disabled { opacity: 0.6; cursor: wait; }
 .ghost { background: transparent; color: var(--text); }
+.ghost.full { width: 100%; margin-top: 10px; }
+.ghost:disabled { opacity: 0.6; cursor: wait; }
 
 .status { color: var(--sub); font-size: 0.85rem; min-height: 1.2em; }
 .status.error { color: var(--high); }

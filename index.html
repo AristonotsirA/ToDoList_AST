@@ -59,12 +59,16 @@
           <option value="claude">Anthropic (Claude)</option>
         </select>
       </label>
-      <label>모델 이름 <input id="model" type="text"></label>
       <label>API 키 <input id="apiKey" type="password" autocomplete="off"></label>
+      <button id="findModels" type="button" class="ghost full">모델 자동으로 찾기</button>
+      <label>우선 사용할 모델
+        <select id="model"><option value="">먼저 모델을 찾아주세요</option></select>
+      </label>
+      <p id="modelInfo" class="hint"></p>
       <p class="hint">키는 이 브라우저에만 저장되고, 선택한 AI 회사 서버로만 전송됩니다.</p>
       <div class="row">
         <button value="cancel" class="ghost">닫기</button>
-        <button id="saveSettings" value="save" class="primary">저장</button>
+        <button id="saveSettings" type="button" class="primary">저장</button>
       </div>
     </form>
   </dialog>
